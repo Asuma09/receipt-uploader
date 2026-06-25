@@ -26,6 +26,12 @@ export async function isReceipt(imageUrl: string): Promise<boolean> {
   );
 
   const j = await r.json();
+
+  if (!r.ok) {
+    const msg = j?.error?.message ?? `Gemini API error (${r.status})`;
+    throw new Error(`Gemini: ${msg}`);
+  }
+
   const text: string =
     j?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
   return text.trim().toLowerCase().startsWith("yes");
