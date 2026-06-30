@@ -288,9 +288,13 @@ export default function CameraCapture() {
       {mode !== "camera" && previewUrl && (
         <div className="bg-black text-white">
           {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src={previewUrl} alt="撮影したレシート" className="w-full" />
+          <img
+            src={previewUrl}
+            alt="撮影したレシート"
+            className="mx-auto block max-h-[45vh] w-full bg-black object-contain"
+          />
 
-          <div className="space-y-4 p-4">
+          <div className="space-y-4 p-4 pb-10">
             <label className="block">
               <span className="text-sm text-gray-300">合計金額（円）</span>
               <input
@@ -315,19 +319,21 @@ export default function CameraCapture() {
               />
             </label>
 
+            <p className="text-center text-sm text-gray-300">{status}</p>
+
             {mode === "review" ? (
               <div className="flex gap-3">
                 <button
                   onClick={backToCamera}
                   disabled={saving}
-                  className="flex-1 rounded-lg border border-white py-3 font-bold disabled:opacity-50"
+                  className="flex-1 rounded-lg border border-white py-4 text-lg font-bold disabled:opacity-50"
                 >
                   撮り直す
                 </button>
                 <button
                   onClick={handleSave}
                   disabled={saving || ocrRunning}
-                  className="flex-1 rounded-lg bg-blue-600 py-3 font-bold disabled:opacity-50"
+                  className="flex-1 rounded-lg bg-blue-600 py-4 text-lg font-bold disabled:opacity-50"
                 >
                   {saving ? "保存中…" : "Notionに保存"}
                 </button>
@@ -335,7 +341,7 @@ export default function CameraCapture() {
             ) : (
               <button
                 onClick={backToCamera}
-                className="w-full rounded-lg bg-blue-600 py-3 font-bold"
+                className="w-full rounded-lg bg-blue-600 py-4 text-lg font-bold"
               >
                 次のレシートへ
               </button>
@@ -344,9 +350,12 @@ export default function CameraCapture() {
         </div>
       )}
 
-      <p className="absolute bottom-4 left-4 z-10 rounded bg-black/70 px-3 py-1 text-white">
-        {status}
-      </p>
+      {/* ステータス帯はカメラ画面のときだけ重ねて表示（確認画面では重ねない） */}
+      {mode === "camera" && (
+        <p className="absolute bottom-4 left-4 z-10 rounded bg-black/70 px-3 py-1 text-white">
+          {status}
+        </p>
+      )}
     </div>
   );
 }
