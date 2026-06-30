@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { uploadImage } from "@/lib/storage";
-import { appendImageToNotion } from "@/lib/notion";
+import { addReceiptRow } from "@/lib/notion";
 
 export const runtime = "nodejs";
 
@@ -15,17 +15,29 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    // フロント（ブラウザOCR＋手直し）から渡される金額・日付
+    const amountRaw = form.get("amount");
+    const dateRaw = form.get("date");
+    const amount =
+      typeof amountRaw === "string" && amountRaw.trim() !== ""
+        ? Number(amountRaw)
+        : null;
+    const date =
+      typeof dateRaw === "string" && dateRaw.trim() !== "" ? dateRaw : undefined;
+
     const buffer = Buffer.from(await file.arrayBuffer());
 
     const imageUrl = await uploadImage(buffer);
-    await appendImageToNotion(imageUrl);
+    await addReceiptRow({
+      imageUrl,
+      amount: amount != null && Number.isFinite(amount) ? amount : null,
+      date,
+    });
 
     return NextResponse.json({ ok: true, imageUrl });
-  } catch (e: any) {
+  } catch (e: unknown) {
     console.error(e);
-    return NextResponse.json(
-      { ok: false, message: e?.message ?? String(e) },
-      { status: 500 }
-    );
+    const message = e instanceof Error ? e.message : String(e);
+    return NextResponse.json({ ok: false, message }, { status: 500 });
   }
 }

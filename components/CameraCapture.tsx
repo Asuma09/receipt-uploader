@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { parseTotalAmount } from "@/lib/parseAmount";
 
 declare global {
   interface Window {
@@ -8,15 +9,39 @@ declare global {
   }
 }
 
+type Mode = "camera" | "review" | "done";
+
+function todayStr() {
+  const d = new Date();
+  const tz = d.getTimezoneOffset() * 60000;
+  return new Date(d.getTime() - tz).toISOString().slice(0, 10);
+}
+
 export default function CameraCapture() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [status, setStatus] = useState("起動中…");
   const [started, setStarted] = useState(false);
-  const stableFramesRef = useRef(0);
-  const cooldownRef = useRef(false);
-  const cvReadyRef = useRef(false);
+  const [mode, setMode] = useState<Mode>("camera");
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [amount, setAmount] = useState("");
+  const [date, setDate] = useState(todayStr());
+  const [ocrRunning, setOcrRunning] = useState(false);
+  const [saving, setSaving] = useState(false);
 
+  const stableFramesRef = useRef(0);
+  const capturingRef = useRef(false);
+  const cvReadyRef = useRef(false);
+  const modeRef = useRef<Mode>("camera");
+  const capturedBlobRef = useRef<Blob | null>(null);
+  const previewUrlRef = useRef<string | null>(null);
+
+  // mode を ref にも反映（検知ループから参照するため）
+  useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
+
+  // OpenCV を読み込み（レシートの自動検知に使用）
   useEffect(() => {
     if (document.getElementById("opencv-script")) {
       cvReadyRef.current = true;
@@ -41,6 +66,15 @@ export default function CameraCapture() {
     document.body.appendChild(script);
   }, []);
 
+  // クリーンアップ
+  useEffect(() => {
+    return () => {
+      if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
+      const stream = videoRef.current?.srcObject as MediaStream | null;
+      stream?.getTracks().forEach((t) => t.stop());
+    };
+  }, []);
+
   async function handleStart() {
     setStarted(true);
     setStatus("カメラ起動中…");
@@ -61,12 +95,12 @@ export default function CameraCapture() {
   }
 
   function loop() {
-    detectReceipt();
+    if (modeRef.current === "camera") detectReceipt();
     setTimeout(() => requestAnimationFrame(loop), 400);
   }
 
   function detectReceipt() {
-    if (cooldownRef.current) return;
+    if (capturingRef.current) return;
     if (!cvReadyRef.current) return;
     const video = videoRef.current;
     const canvas = canvasRef.current;
@@ -132,39 +166,101 @@ export default function CameraCapture() {
     }
   }
 
-  async function capture() {
-    cooldownRef.current = true;
+  function capture() {
+    if (capturingRef.current) return;
+    capturingRef.current = true;
+    setMode("review");
+    modeRef.current = "review";
     setStatus("撮影中…");
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    if (!canvas) {
+      capturingRef.current = false;
+      return;
+    }
     canvas.toBlob(
       async (blob) => {
         if (!blob) {
-          cooldownRef.current = false;
+          capturingRef.current = false;
           return;
         }
-        const form = new FormData();
-        form.append("file", blob, "receipt.jpg");
-        try {
-          const res = await fetch("/api/upload", {
-            method: "POST",
-            body: form,
-          });
-          const json = await res.json();
-          setStatus(
-            json.ok ? "✅ Notion に投稿しました" : `⚠ ${json.message}`
-          );
-        } catch (e: any) {
-          setStatus(`⚠ 送信エラー: ${e?.message ?? e}`);
-        } finally {
-          setTimeout(() => {
-            cooldownRef.current = false;
-          }, 3000);
-        }
+        capturedBlobRef.current = blob;
+        if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
+        const url = URL.createObjectURL(blob);
+        previewUrlRef.current = url;
+        setPreviewUrl(url);
+        await runOcr(blob);
+        capturingRef.current = false;
       },
       "image/jpeg",
       0.85
     );
+  }
+
+  async function runOcr(blob: Blob) {
+    setOcrRunning(true);
+    setAmount("");
+    setStatus("文字を解析中…（初回は言語データのDLで時間がかかります）");
+    try {
+      const Tesseract = (await import("tesseract.js")).default;
+      const { data } = await Tesseract.recognize(blob, "jpn+eng", {
+        logger: (m: any) => {
+          if (m.status === "recognizing text") {
+            setStatus(`文字を解析中… ${Math.round((m.progress ?? 0) * 100)}%`);
+          }
+        },
+      });
+      const guess = parseTotalAmount(data?.text ?? "");
+      if (guess != null) {
+        setAmount(String(guess));
+        setStatus("金額を読み取りました。確認・修正して保存してください");
+      } else {
+        setStatus("金額を自動入力できませんでした。手入力してください");
+      }
+    } catch (e: any) {
+      setStatus(`OCRエラー: ${e?.message ?? e}（金額は手入力してください）`);
+    } finally {
+      setOcrRunning(false);
+    }
+  }
+
+  async function handleSave() {
+    const blob = capturedBlobRef.current;
+    if (!blob) return;
+    setSaving(true);
+    setStatus("保存中…");
+    try {
+      const form = new FormData();
+      form.append("file", blob, "receipt.jpg");
+      if (amount.trim() !== "") form.append("amount", amount.trim());
+      form.append("date", date);
+      const res = await fetch("/api/upload", { method: "POST", body: form });
+      const json = await res.json();
+      if (json.ok) {
+        setMode("done");
+        setStatus("✅ Notion に保存しました");
+      } else {
+        setStatus(`⚠ ${json.message}`);
+      }
+    } catch (e: any) {
+      setStatus(`⚠ 送信エラー: ${e?.message ?? e}`);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function backToCamera() {
+    capturedBlobRef.current = null;
+    if (previewUrlRef.current) {
+      URL.revokeObjectURL(previewUrlRef.current);
+      previewUrlRef.current = null;
+    }
+    setPreviewUrl(null);
+    setAmount("");
+    setDate(todayStr());
+    stableFramesRef.current = 0;
+    setMode("camera");
+    modeRef.current = "camera";
+    setStatus("レシートをカメラに向けてください");
   }
 
   return (
@@ -178,14 +274,77 @@ export default function CameraCapture() {
           カメラを開始
         </button>
       )}
+
+      {/* カメラ映像（撮影モードのときだけ表示） */}
       <video
         ref={videoRef}
         playsInline
         muted
-        className="w-full bg-black"
+        className={`w-full bg-black ${mode === "camera" ? "" : "hidden"}`}
       />
       <canvas ref={canvasRef} className="hidden" />
-      <p className="absolute bottom-4 left-4 bg-black/70 text-white px-3 py-1 rounded">
+
+      {/* 確認・保存モード */}
+      {mode !== "camera" && previewUrl && (
+        <div className="bg-black text-white">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src={previewUrl} alt="撮影したレシート" className="w-full" />
+
+          <div className="space-y-4 p-4">
+            <label className="block">
+              <span className="text-sm text-gray-300">合計金額（円）</span>
+              <input
+                type="number"
+                inputMode="numeric"
+                value={amount}
+                onChange={(e) => setAmount(e.target.value)}
+                placeholder={ocrRunning ? "解析中…" : "金額を入力"}
+                disabled={mode === "done"}
+                className="mt-1 w-full rounded-lg bg-white px-3 py-3 text-2xl font-bold text-black"
+              />
+            </label>
+
+            <label className="block">
+              <span className="text-sm text-gray-300">日付</span>
+              <input
+                type="date"
+                value={date}
+                onChange={(e) => setDate(e.target.value)}
+                disabled={mode === "done"}
+                className="mt-1 w-full rounded-lg bg-white px-3 py-3 text-black"
+              />
+            </label>
+
+            {mode === "review" ? (
+              <div className="flex gap-3">
+                <button
+                  onClick={backToCamera}
+                  disabled={saving}
+                  className="flex-1 rounded-lg border border-white py-3 font-bold disabled:opacity-50"
+                >
+                  撮り直す
+                </button>
+                <button
+                  onClick={handleSave}
+                  disabled={saving || ocrRunning}
+                  className="flex-1 rounded-lg bg-blue-600 py-3 font-bold disabled:opacity-50"
+                >
+                  {saving ? "保存中…" : "Notionに保存"}
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={backToCamera}
+                className="w-full rounded-lg bg-blue-600 py-3 font-bold"
+              >
+                次のレシートへ
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      <p className="absolute bottom-4 left-4 z-10 rounded bg-black/70 px-3 py-1 text-white">
         {status}
       </p>
     </div>
