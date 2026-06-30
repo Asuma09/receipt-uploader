@@ -17,6 +17,124 @@ function todayStr() {
   return new Date(d.getTime() - tz).toISOString().slice(0, 10);
 }
 
+// 4点を tl, tr, br, bl の順に並べ替える。
+// s = x+y が最小→左上, 最大→右下 ; d = x-y が最大→右上, 最小→左下
+function orderQuad(pts: number[][]): number[][] {
+  let tl = pts[0];
+  let br = pts[0];
+  let tr = pts[0];
+  let bl = pts[0];
+  let minS = Infinity;
+  let maxS = -Infinity;
+  let maxD = -Infinity;
+  let minD = Infinity;
+  for (const p of pts) {
+    const s = p[0] + p[1];
+    const d = p[0] - p[1];
+    if (s < minS) {
+      minS = s;
+      tl = p;
+    }
+    if (s > maxS) {
+      maxS = s;
+      br = p;
+    }
+    if (d > maxD) {
+      maxD = d;
+      tr = p;
+    }
+    if (d < minD) {
+      minD = d;
+      bl = p;
+    }
+  }
+  return [tl, tr, br, bl];
+}
+
+// グレースケール画像 gray からレシートの4隅を検出し、真上から見た長方形に
+// 射影変換して dst に書き込む。成功したら true。縦長の大きな四角形のみ対象。
+function warpReceipt(cv: any, gray: any, dst: any): boolean {
+  const blur = new cv.Mat();
+  const edges = new cv.Mat();
+  const contours = new cv.MatVector();
+  const hierarchy = new cv.Mat();
+  let srcTri: any = null;
+  let dstTri: any = null;
+  let M: any = null;
+  try {
+    cv.GaussianBlur(gray, blur, new cv.Size(5, 5), 0);
+    cv.Canny(blur, edges, 60, 180);
+    cv.findContours(
+      edges,
+      contours,
+      hierarchy,
+      cv.RETR_EXTERNAL,
+      cv.CHAIN_APPROX_SIMPLE
+    );
+
+    const frameArea = gray.cols * gray.rows;
+    let best: { pts: number[][]; area: number } | null = null;
+    for (let i = 0; i < contours.size(); i++) {
+      const cnt = contours.get(i);
+      const peri = cv.arcLength(cnt, true);
+      const approx = new cv.Mat();
+      cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
+      if (approx.rows === 4) {
+        const area = cv.contourArea(approx);
+        if (area > frameArea * 0.2 && (!best || area > best.area)) {
+          const pts: number[][] = [];
+          for (let r = 0; r < 4; r++) {
+            pts.push([approx.data32S[r * 2], approx.data32S[r * 2 + 1]]);
+          }
+          best = { pts, area };
+        }
+      }
+      approx.delete();
+      cnt.delete();
+    }
+
+    if (!best) return false;
+
+    const [tl, tr, br, bl] = orderQuad(best.pts);
+    const W = Math.max(
+      Math.hypot(br[0] - bl[0], br[1] - bl[1]),
+      Math.hypot(tr[0] - tl[0], tr[1] - tl[1])
+    );
+    const H = Math.max(
+      Math.hypot(tr[0] - br[0], tr[1] - br[1]),
+      Math.hypot(tl[0] - bl[0], tl[1] - bl[1])
+    );
+    if (W < 50 || H < 50) return false;
+    if (H < W * 0.9) return false; // レシートは縦長。横長なら誤検出とみなす
+
+    srcTri = cv.matFromArray(4, 1, cv.CV_32FC2, [
+      tl[0], tl[1], tr[0], tr[1], br[0], br[1], bl[0], bl[1],
+    ]);
+    dstTri = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, W, 0, W, H, 0, H]);
+    M = cv.getPerspectiveTransform(srcTri, dstTri);
+    cv.warpPerspective(
+      gray,
+      dst,
+      M,
+      new cv.Size(Math.round(W), Math.round(H)),
+      cv.INTER_LINEAR,
+      cv.BORDER_CONSTANT,
+      new cv.Scalar(255, 255, 255, 255)
+    );
+    return true;
+  } catch {
+    return false;
+  } finally {
+    blur.delete();
+    edges.delete();
+    contours.delete();
+    hierarchy.delete();
+    if (srcTri) srcTri.delete();
+    if (dstTri) dstTri.delete();
+    if (M) M.delete();
+  }
+}
+
 export default function CameraCapture() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -217,7 +335,8 @@ export default function CameraCapture() {
   }
 
   // OCRの精度を上げるための前処理。
-  // グレースケール → 小さい文字向けに拡大 → 適応的二値化（影・ムラに強い）。
+  // 1) グレースケール 2) レシートの4隅を検出して傾き・歪みを補正
+  // 3) 拡大 4) CLAHEでコントラスト強調 5) ノイズ除去→Otsu二値化。
   // OpenCV が未準備ならカラー原本をそのまま返す。
   function makeOcrBlob(): Promise<Blob | null> {
     return new Promise((resolve) => {
@@ -228,54 +347,80 @@ export default function CameraCapture() {
         canvas.toBlob((b) => resolve(b), "image/jpeg", 0.95);
         return;
       }
+
+      const mats: any[] = [];
+      const track = <T,>(m: T): T => {
+        mats.push(m);
+        return m;
+      };
+      const cleanup = () =>
+        mats.forEach((m) => {
+          try {
+            m.delete();
+          } catch {}
+        });
+
       try {
-        const src = cv.imread(canvas);
-        const gray = new cv.Mat();
+        const src = track(cv.imread(canvas));
+        const gray = track(new cv.Mat());
         cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
 
-        // 幅 ~1600px を目安に拡大（小さな文字をくっきりさせる）
+        // 傾き・歪み補正（4隅が取れたときだけ）
+        const warped = track(new cv.Mat());
+        const dewarped = warpReceipt(cv, gray, warped);
+        const base = dewarped ? warped : gray;
+
+        // 幅 ~1600px を目安に拡大
         const targetW = 1600;
         const factor =
-          gray.cols > 0 && gray.cols < targetW ? targetW / gray.cols : 1;
-        const work = new cv.Mat();
+          base.cols > 0 && base.cols < targetW ? targetW / base.cols : 1;
+        const sized = track(new cv.Mat());
         if (factor !== 1) {
           cv.resize(
-            gray,
-            work,
+            base,
+            sized,
             new cv.Size(
-              Math.round(gray.cols * factor),
-              Math.round(gray.rows * factor)
+              Math.round(base.cols * factor),
+              Math.round(base.rows * factor)
             ),
             0,
             0,
             cv.INTER_CUBIC
           );
         } else {
-          gray.copyTo(work);
+          base.copyTo(sized);
         }
 
-        cv.GaussianBlur(work, work, new cv.Size(3, 3), 0);
-        const bin = new cv.Mat();
-        cv.adaptiveThreshold(
-          work,
+        // CLAHE でコントラスト強調（かすれ文字対策）。無ければスキップ。
+        const eq = track(new cv.Mat());
+        let enhanced = sized;
+        try {
+          const clahe = new cv.CLAHE(2.0, new cv.Size(8, 8));
+          clahe.apply(sized, eq);
+          clahe.delete();
+          enhanced = eq;
+        } catch {
+          enhanced = sized;
+        }
+
+        // ノイズ低減 → Otsu二値化
+        const den = track(new cv.Mat());
+        cv.medianBlur(enhanced, den, 3);
+        const bin = track(new cv.Mat());
+        cv.threshold(
+          den,
           bin,
+          0,
           255,
-          cv.ADAPTIVE_THRESH_GAUSSIAN_C,
-          cv.THRESH_BINARY,
-          31,
-          15
+          cv.THRESH_BINARY + cv.THRESH_OTSU
         );
 
         const out = document.createElement("canvas");
         cv.imshow(out, bin);
-
-        src.delete();
-        gray.delete();
-        work.delete();
-        bin.delete();
-
+        cleanup();
         out.toBlob((b) => resolve(b), "image/png");
       } catch {
+        cleanup();
         canvas.toBlob((b) => resolve(b), "image/jpeg", 0.95);
       }
     });
@@ -286,15 +431,22 @@ export default function CameraCapture() {
     setAmount("");
     setOcrText("");
     setStatus("文字を解析中…（初回は言語データのDLで時間がかかります）");
+    let worker: any = null;
     try {
       const Tesseract = (await import("tesseract.js")).default;
-      const { data } = await Tesseract.recognize(blob, "jpn+eng", {
+      worker = await Tesseract.createWorker("jpn+eng", 1, {
         logger: (m: any) => {
           if (m.status === "recognizing text") {
             setStatus(`文字を解析中… ${Math.round((m.progress ?? 0) * 100)}%`);
           }
         },
       });
+      // レシートは1列のブロック。PSM=6（単一ブロック）で誤読を減らす。
+      await worker.setParameters({
+        tessedit_pageseg_mode: "6",
+        preserve_interword_spaces: "1",
+      });
+      const { data } = await worker.recognize(blob);
       const text = data?.text ?? "";
       setOcrText(text);
       const guess = parseTotalAmount(text);
@@ -307,6 +459,11 @@ export default function CameraCapture() {
     } catch (e: any) {
       setStatus(`OCRエラー: ${e?.message ?? e}（金額は手入力してください）`);
     } finally {
+      if (worker) {
+        try {
+          await worker.terminate();
+        } catch {}
+      }
       setOcrRunning(false);
     }
   }
