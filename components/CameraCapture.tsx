@@ -147,6 +147,7 @@ export default function CameraCapture() {
   const [ocrRunning, setOcrRunning] = useState(false);
   const [saving, setSaving] = useState(false);
   const [ocrText, setOcrText] = useState("");
+  const [ocrPreviewUrl, setOcrPreviewUrl] = useState<string | null>(null);
 
   const stableFramesRef = useRef(0);
   const capturingRef = useRef(false);
@@ -154,6 +155,7 @@ export default function CameraCapture() {
   const modeRef = useRef<Mode>("camera");
   const capturedBlobRef = useRef<Blob | null>(null);
   const previewUrlRef = useRef<string | null>(null);
+  const ocrPreviewUrlRef = useRef<string | null>(null);
 
   // mode を ref にも反映（検知ループから参照するため）
   useEffect(() => {
@@ -189,6 +191,8 @@ export default function CameraCapture() {
   useEffect(() => {
     return () => {
       if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
+      if (ocrPreviewUrlRef.current)
+        URL.revokeObjectURL(ocrPreviewUrlRef.current);
       const stream = videoRef.current?.srcObject as MediaStream | null;
       stream?.getTracks().forEach((t) => t.stop());
     };
@@ -326,6 +330,13 @@ export default function CameraCapture() {
 
         // OCR用：前処理（白黒・拡大）した別画像を渡す
         const ocrBlob = await makeOcrBlob();
+        if (ocrBlob) {
+          if (ocrPreviewUrlRef.current)
+            URL.revokeObjectURL(ocrPreviewUrlRef.current);
+          const purl = URL.createObjectURL(ocrBlob);
+          ocrPreviewUrlRef.current = purl;
+          setOcrPreviewUrl(purl);
+        }
         await runOcr(ocrBlob ?? blob);
         capturingRef.current = false;
       },
@@ -403,20 +414,20 @@ export default function CameraCapture() {
           enhanced = sized;
         }
 
-        // ノイズ低減 → Otsu二値化
-        const den = track(new cv.Mat());
-        cv.medianBlur(enhanced, den, 3);
+        // アンシャープマスクで輪郭を強調（かすれた細い文字を立たせる）
+        const blurred = track(new cv.Mat());
+        cv.GaussianBlur(enhanced, blurred, new cv.Size(0, 0), 3);
+        const sharp = track(new cv.Mat());
+        cv.addWeighted(enhanced, 1.5, blurred, -0.5, 0, sharp);
+
+        // Otsu二値化 → 単独ノイズ点を中央値フィルタで除去
         const bin = track(new cv.Mat());
-        cv.threshold(
-          den,
-          bin,
-          0,
-          255,
-          cv.THRESH_BINARY + cv.THRESH_OTSU
-        );
+        cv.threshold(sharp, bin, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+        const clean = track(new cv.Mat());
+        cv.medianBlur(bin, clean, 3);
 
         const out = document.createElement("canvas");
-        cv.imshow(out, bin);
+        cv.imshow(out, clean);
         cleanup();
         out.toBlob((b) => resolve(b), "image/png");
       } catch {
@@ -445,6 +456,7 @@ export default function CameraCapture() {
       await worker.setParameters({
         tessedit_pageseg_mode: "6",
         preserve_interword_spaces: "1",
+        user_defined_dpi: "300",
       });
       const { data } = await worker.recognize(blob);
       const text = data?.text ?? "";
@@ -500,6 +512,11 @@ export default function CameraCapture() {
       previewUrlRef.current = null;
     }
     setPreviewUrl(null);
+    if (ocrPreviewUrlRef.current) {
+      URL.revokeObjectURL(ocrPreviewUrlRef.current);
+      ocrPreviewUrlRef.current = null;
+    }
+    setOcrPreviewUrl(null);
     setAmount("");
     setOcrText("");
     setDate(todayStr());
@@ -567,14 +584,30 @@ export default function CameraCapture() {
 
             <p className="text-center text-sm text-gray-300">{status}</p>
 
-            {ocrText && (
+            {(ocrText || ocrPreviewUrl) && (
               <details className="text-xs text-gray-400">
                 <summary className="cursor-pointer">
-                  読み取りテキスト（デバッグ用）
+                  読み取りの詳細（デバッグ用）
                 </summary>
-                <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap rounded bg-white/10 p-2">
-                  {ocrText}
-                </pre>
+                {ocrPreviewUrl && (
+                  <>
+                    <p className="mt-2">OCRに渡した白黒画像:</p>
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={ocrPreviewUrl}
+                      alt="OCR前処理画像"
+                      className="mt-1 max-h-72 w-auto border border-white/20 bg-white"
+                    />
+                  </>
+                )}
+                {ocrText && (
+                  <>
+                    <p className="mt-2">読み取りテキスト:</p>
+                    <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap rounded bg-white/10 p-2">
+                      {ocrText}
+                    </pre>
+                  </>
+                )}
               </details>
             )}
 
