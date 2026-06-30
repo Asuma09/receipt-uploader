@@ -28,6 +28,7 @@ export default function CameraCapture() {
   const [date, setDate] = useState(todayStr());
   const [ocrRunning, setOcrRunning] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [ocrText, setOcrText] = useState("");
 
   const stableFramesRef = useRef(0);
   const capturingRef = useRef(false);
@@ -80,13 +81,17 @@ export default function CameraCapture() {
     setStatus("カメラ起動中…");
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: "environment" } },
+        video: {
+          facingMode: { ideal: "environment" },
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+        },
         audio: false,
       });
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         await videoRef.current.play();
-        setStatus("レシートをカメラに向けてください");
+        setStatus("レシートを画面いっぱいに写してください");
         requestAnimationFrame(loop);
       }
     } catch (e: any) {
@@ -162,25 +167,37 @@ export default function CameraCapture() {
       }
     } else {
       stableFramesRef.current = 0;
-      setStatus("レシートをカメラに向けてください");
+      setStatus("レシートを画面いっぱいに写してください");
     }
   }
 
   function capture() {
     if (capturingRef.current) return;
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    if (!video || !canvas || !video.videoWidth) return;
     capturingRef.current = true;
     setMode("review");
     modeRef.current = "review";
     setStatus("撮影中…");
-    const canvas = canvasRef.current;
-    if (!canvas) {
+
+    // 押した瞬間の最新フレームをキャンバスへ描画
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
       capturingRef.current = false;
       return;
     }
+    ctx.drawImage(video, 0, 0);
+
+    // 保存用：カラー原本
     canvas.toBlob(
       async (blob) => {
         if (!blob) {
           capturingRef.current = false;
+          setMode("camera");
+          modeRef.current = "camera";
           return;
         }
         capturedBlobRef.current = blob;
@@ -188,17 +205,86 @@ export default function CameraCapture() {
         const url = URL.createObjectURL(blob);
         previewUrlRef.current = url;
         setPreviewUrl(url);
-        await runOcr(blob);
+
+        // OCR用：前処理（白黒・拡大）した別画像を渡す
+        const ocrBlob = await makeOcrBlob();
+        await runOcr(ocrBlob ?? blob);
         capturingRef.current = false;
       },
       "image/jpeg",
-      0.85
+      0.9
     );
+  }
+
+  // OCRの精度を上げるための前処理。
+  // グレースケール → 小さい文字向けに拡大 → 適応的二値化（影・ムラに強い）。
+  // OpenCV が未準備ならカラー原本をそのまま返す。
+  function makeOcrBlob(): Promise<Blob | null> {
+    return new Promise((resolve) => {
+      const canvas = canvasRef.current;
+      const cv = window.cv;
+      if (!canvas) return resolve(null);
+      if (!cv || !cvReadyRef.current) {
+        canvas.toBlob((b) => resolve(b), "image/jpeg", 0.95);
+        return;
+      }
+      try {
+        const src = cv.imread(canvas);
+        const gray = new cv.Mat();
+        cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+
+        // 幅 ~1600px を目安に拡大（小さな文字をくっきりさせる）
+        const targetW = 1600;
+        const factor =
+          gray.cols > 0 && gray.cols < targetW ? targetW / gray.cols : 1;
+        const work = new cv.Mat();
+        if (factor !== 1) {
+          cv.resize(
+            gray,
+            work,
+            new cv.Size(
+              Math.round(gray.cols * factor),
+              Math.round(gray.rows * factor)
+            ),
+            0,
+            0,
+            cv.INTER_CUBIC
+          );
+        } else {
+          gray.copyTo(work);
+        }
+
+        cv.GaussianBlur(work, work, new cv.Size(3, 3), 0);
+        const bin = new cv.Mat();
+        cv.adaptiveThreshold(
+          work,
+          bin,
+          255,
+          cv.ADAPTIVE_THRESH_GAUSSIAN_C,
+          cv.THRESH_BINARY,
+          31,
+          15
+        );
+
+        const out = document.createElement("canvas");
+        cv.imshow(out, bin);
+
+        src.delete();
+        gray.delete();
+        work.delete();
+        bin.delete();
+
+        out.toBlob((b) => resolve(b), "image/png");
+      } catch {
+        canvas.toBlob((b) => resolve(b), "image/jpeg", 0.95);
+      }
+    });
   }
 
   async function runOcr(blob: Blob) {
     setOcrRunning(true);
     setAmount("");
+    setOcrText("");
     setStatus("文字を解析中…（初回は言語データのDLで時間がかかります）");
     try {
       const Tesseract = (await import("tesseract.js")).default;
@@ -209,7 +295,9 @@ export default function CameraCapture() {
           }
         },
       });
-      const guess = parseTotalAmount(data?.text ?? "");
+      const text = data?.text ?? "";
+      setOcrText(text);
+      const guess = parseTotalAmount(text);
       if (guess != null) {
         setAmount(String(guess));
         setStatus("金額を読み取りました。確認・修正して保存してください");
@@ -256,11 +344,12 @@ export default function CameraCapture() {
     }
     setPreviewUrl(null);
     setAmount("");
+    setOcrText("");
     setDate(todayStr());
     stableFramesRef.current = 0;
     setMode("camera");
     modeRef.current = "camera";
-    setStatus("レシートをカメラに向けてください");
+    setStatus("レシートを画面いっぱいに写してください");
   }
 
   return (
@@ -321,6 +410,17 @@ export default function CameraCapture() {
 
             <p className="text-center text-sm text-gray-300">{status}</p>
 
+            {ocrText && (
+              <details className="text-xs text-gray-400">
+                <summary className="cursor-pointer">
+                  読み取りテキスト（デバッグ用）
+                </summary>
+                <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap rounded bg-white/10 p-2">
+                  {ocrText}
+                </pre>
+              </details>
+            )}
+
             {mode === "review" ? (
               <div className="flex gap-3">
                 <button
@@ -350,11 +450,20 @@ export default function CameraCapture() {
         </div>
       )}
 
-      {/* ステータス帯はカメラ画面のときだけ重ねて表示（確認画面では重ねない） */}
+      {/* カメラ画面のステータスは上部に表示（下のシャッターと重ならないように） */}
       {mode === "camera" && (
-        <p className="absolute bottom-4 left-4 z-10 rounded bg-black/70 px-3 py-1 text-white">
+        <p className="absolute left-4 top-4 z-10 rounded bg-black/70 px-3 py-1 text-sm text-white">
           {status}
         </p>
+      )}
+
+      {/* 手動シャッター（自動検知に加えて、ピントが合った瞬間に撮れる） */}
+      {started && mode === "camera" && (
+        <button
+          onClick={capture}
+          aria-label="撮影"
+          className="absolute bottom-6 left-1/2 z-10 h-16 w-16 -translate-x-1/2 rounded-full border-4 border-white bg-white/30 shadow-lg active:bg-white/70"
+        />
       )}
     </div>
   );
